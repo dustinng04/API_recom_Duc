@@ -47,6 +47,11 @@ class UserRecommendation(BaseModel):
 class RecommendResponse(BaseModel):
     data: List[UserRecommendation]
 
+class MetricsResponse(BaseModel):
+    metrics: Dict
+    description: str
+    top_k: int
+
 
 # Startup event
 @app.on_event("startup")
@@ -62,15 +67,38 @@ async def startup_event():
             recommender.load_model("models/recommender.pkl")
             logger.info("Existing model loaded successfully")
         else:
-            # Load and train with default data
-            data_path = Path("data/tutors_adjust.json")
-            if data_path.exists():
-                logger.info("No existing model found. Training with default data...")
-                with open(data_path, 'r', encoding='utf-8') as f:
+            # Load and train with all data sources
+            tutors_path = Path("data/tutors_adjust.json")
+            students_path = Path("data/students_output.json")
+            interactions_path = Path("data/interaction_logs.jsonl")
+            
+            if tutors_path.exists():
+                logger.info("No existing model found. Training with all available data...")
+                
+                # Load tutors
+                with open(tutors_path, 'r', encoding='utf-8') as f:
                     tutors_data = json.load(f)
-                recommender.train(tutors_data)
+                
+                # Load students if available
+                students_data = None
+                if students_path.exists():
+                    with open(students_path, 'r', encoding='utf-8') as f:
+                        students_data = json.load(f)
+                    logger.info(f"Loaded {len(students_data)} students")
+                
+                # Load interactions if available
+                interactions_data = None
+                if interactions_path.exists():
+                    with open(interactions_path, 'r', encoding='utf-8') as f:
+                        interactions_data = [json.loads(line) for line in f]
+                    logger.info(f"Loaded {len(interactions_data)} interactions")
+                
+                # Train with all data
+                recommender.train(tutors_data, students_data, interactions_data)
                 recommender.save_model("models/recommender.pkl")
-                logger.info(f"Model trained with {len(tutors_data)} tutors")
+                logger.info(f"Model trained with {len(tutors_data)} tutors, "
+                          f"{len(students_data) if students_data else 0} students, "
+                          f"{len(interactions_data) if interactions_data else 0} interactions")
             else:
                 logger.warning("No data file found. Model will be empty until /train is called.")
 
@@ -101,7 +129,10 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": True,
-        "tutors_count": len(recommender.tutors_df) if recommender.tutors_df is not None else 0
+        "tutors_count": len(recommender.tutors_df) if recommender.tutors_df is not None else 0,
+        "students_count": len(recommender.students_df) if recommender.students_df is not None else 0,
+        "interactions_count": len(recommender.interactions_df) if recommender.interactions_df is not None else 0,
+        "personalization_enabled": recommender.students_df is not None or recommender.interactions_df is not None
     }
 
 
@@ -174,4 +205,58 @@ async def get_recommendations(request: RecommendRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate recommendations: {str(e)}"
+        )
+
+
+# Get metrics endpoint
+@app.get("/get_metrics", response_model=MetricsResponse)
+async def get_metrics(top_k: int = 10):
+    """
+    Evaluate recommendation system performance.
+    
+    Metrics:
+    - precision@k: % of recommended items that are relevant
+    - recall@k: % of relevant items that are recommended
+    - ndcg@k: Normalized Discounted Cumulative Gain (ranking quality)
+    - coverage: % of tutors recommended at least once
+    
+    Args:
+        top_k: Number of recommendations to evaluate (default 10)
+    """
+    try:
+        if recommender is None or recommender.tutors_df is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model not loaded. Please train the model first using /train endpoint"
+            )
+        
+        if recommender.interactions_df is None or len(recommender.interactions_df) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No interaction data available for evaluation. Metrics require interaction history."
+            )
+        
+        logger.info(f"Evaluating metrics with top_k={top_k}")
+        
+        # Evaluate using training data
+        metrics = recommender.evaluate_metrics(top_k=top_k)
+        
+        description = (
+            f"Evaluated on {metrics['users_evaluated']} users with interaction history. "
+            f"Metrics show how well the system recommends tutors that users actually engaged with."
+        )
+        
+        return MetricsResponse(
+            metrics=metrics,
+            description=description,
+            top_k=top_k
+        )
+    
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Metrics evaluation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to evaluate metrics: {str(e)}"
         )

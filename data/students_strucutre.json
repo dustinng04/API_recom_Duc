@@ -1,0 +1,24 @@
+{
+    "id": "stu_001",
+    "name": "Le Minh Duc",
+    "age": 17,
+    "schoolLevel": "High School",
+    "schoolName": "Le Hong Phong High School",
+    "preferredTeachingStyles": ["Structured", "Supportive"],
+  
+    "subjectPreferences": [
+        { "id": 842435799, "levels": [555001, 555002 ] },
+        { "id": 273843214, "levels": [555004] } 
+    ],
+  
+    "enrollments": [
+      { "tutorId": "t_103", "subjectId": 842435799, "levelId": 555001, "status": "completed" },
+      { "tutorId": "t_205", "subjectId": 273843214, "levelId": 555003, "status": "ongoing" }
+    ],
+  
+    "tutorRatings": [
+      { "tutorId": "t_103", "rating": 4.8 },
+      { "tutorId": "t_317", "rating": 4.5 }
+    ]
+  }
+  
