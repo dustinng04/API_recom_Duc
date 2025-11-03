@@ -402,3 +402,86 @@ class TutorRecommender:
             'coverage': round(coverage, 4),
             'users_evaluated': len(precisions)
         }
+
+    def score_candidates(self, user_id: Optional[str], tutor_ids: List[int]) -> Dict[int, float]:
+        """
+        Compute a personalized score for the given tutor_ids for a specific user.
+        This reuses the existing hybrid components (content/quality, style overlap,
+        collaborative, behavioral). The returned scores are NOT normalized.
+
+        Args:
+            user_id: The user identifier to personalize for (can be None for non-personalized).
+            tutor_ids: List of tutor ids to score.
+
+        Returns:
+            Dict mapping tutor_id -> raw score (float).
+        """
+        if self.tutors_df is None or len(tutor_ids) == 0:
+            return {int(tid): 0.0 for tid in tutor_ids}
+
+        df = self.tutors_df
+        mask = df['id'].isin(tutor_ids)
+        sub = df[mask].copy()
+
+        # Base content/quality score (same as in recommend())
+        rating_score = sub['rating'] / 5.0
+        exp_score = np.minimum(sub['yearExperience'] / 10.0, 1.0)
+        students_score = np.log1p(sub['studentsCount']) / np.log1p(df['studentsCount'].max())
+        reviews_score = np.log1p(sub['numberReviews']) / np.log1p(df['numberReviews'].max())
+        prof_bonus = sub['isProfessional'].astype(float) * 0.1
+
+        base = (
+            0.3 * rating_score +
+            0.2 * exp_score +
+            0.2 * students_score +
+            0.2 * reviews_score +
+            0.1 * prof_bonus
+        )
+
+        scores: Dict[int, float] = {int(tid): self.weights['content'] * base.iloc[i]
+                                    for i, tid in enumerate(sub['id'])}
+
+        # Personalization components if user exists in students_df
+        if user_id and self.students_df is not None and len(self.students_df) > 0:
+            student = self.students_df[self.students_df['id'] == user_id]
+            if not student.empty:
+                srow = student.iloc[0]
+                s_styles = set(srow.get('teaching_styles_list', []))
+
+                # Teaching style overlap (Jaccard)
+                for _, row in sub.iterrows():
+                    tid = int(row['id'])
+                    t_styles = set([s['en'] for s in row['teachingStyle']] if isinstance(row['teachingStyle'], list) else [])
+                    if s_styles and t_styles:
+                        overlap = len(s_styles & t_styles) / len(s_styles | t_styles)
+                        scores[tid] += self.weights['quality'] * overlap
+
+                # Collaborative via similar students
+                similar_students = self._find_similar_students(srow, top_k=5)
+                for sim_id, sim in similar_students:
+                    ss = self.students_df[self.students_df['id'] == sim_id]
+                    if ss.empty:
+                        continue
+                    enrollments = ss.iloc[0].get('enrollments', [])
+                    if isinstance(enrollments, list):
+                        for en in enrollments:
+                            if en.get('status') == 'completed':
+                                tid = int(en['tutorId'])
+                                if tid in scores:
+                                    scores[tid] += self.weights['collaborative'] * 0.5 * sim
+                    ratings = ss.iloc[0].get('tutorRatings', [])
+                    if isinstance(ratings, list):
+                        for r in ratings:
+                            if r.get('rating', 0) >= 4.0:
+                                tid = int(r['tutorId'])
+                                if tid in scores:
+                                    scores[tid] += self.weights['collaborative'] * 0.3 * sim * (r['rating'] / 5.0)
+
+                # Behavioral history
+                if self.student_tutor_matrix and user_id in self.student_tutor_matrix:
+                    for tid, beh in self.student_tutor_matrix[user_id].items():
+                        tid = int(tid)
+                        if tid in scores:
+                            scores[tid] += self.weights['behavioral'] * beh
+
+        return scores

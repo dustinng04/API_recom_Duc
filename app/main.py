@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import logging
 from datetime import datetime
 import json
@@ -51,6 +51,22 @@ class MetricsResponse(BaseModel):
     metrics: Dict
     description: str
     top_k: int
+
+
+class RerankCandidate(BaseModel):
+    tutorId: int
+    os_score: float
+
+
+class RerankRequest(BaseModel):
+    user_id: Optional[str] = None
+    query_vector: List[float]
+    candidates: List[RerankCandidate]
+
+
+class RerankResponse(BaseModel):
+    # Keep response minimal and aligned with candidates order for easy merging on caller side
+    scores: List[float]
 
 
 # Startup event
@@ -207,6 +223,60 @@ async def get_recommendations(request: RecommendRequest):
             detail=f"Failed to generate recommendations: {str(e)}"
         )
 
+
+# Re-rank endpoint (minimal response: scores aligned with input order)
+@app.post("/rerank", response_model=RerankResponse)
+async def rerank(request: RerankRequest):
+    try:
+        if recommender is None or recommender.tutors_df is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model not loaded. Please train the model first using /train endpoint"
+            )
+
+        # Extract tutor ids in the same order as provided
+        input_ids = [c.tutorId for c in request.candidates]
+
+        # Map tutorId -> os_score
+        os_map = {c.tutorId: c.os_score for c in request.candidates}
+
+        # Personalization scores (raw, not normalized)
+        rec_scores = recommender.score_candidates(user_id=request.user_id, tutor_ids=input_ids)
+
+        # Build arrays aligned with input order
+        import numpy as np
+        os_arr = np.array([os_map.get(tid, 0.0) for tid in input_ids], dtype=float)
+        rec_arr = np.array([rec_scores.get(tid, 0.0) for tid in input_ids], dtype=float)
+
+        # Per-request min-max normalization to [0,1]
+        def min_max(x: np.ndarray) -> np.ndarray:
+            x_min = float(x.min()) if x.size else 0.0
+            x_max = float(x.max()) if x.size else 0.0
+            if x_max > x_min:
+                return (x - x_min) / (x_max - x_min)
+            return np.zeros_like(x)
+
+        os_norm = min_max(os_arr)
+        rec_norm = min_max(rec_arr)
+
+        # Note: query_vector is accepted for future use (query-tutor similarity),
+        # but intentionally unused in this minimal version for simplicity.
+        # We'll incorporate it later without changing the API contract.
+
+        # Weighted combination (tunable per business needs)
+        w_os, w_rec = 0.6, 0.4
+        final = w_os * os_norm + w_rec * rec_norm
+
+        return RerankResponse(scores=[float(s) for s in final.tolist()])
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Rerank error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to rerank: {str(e)}"
+        )
 
 # Get metrics endpoint
 @app.get("/get_metrics", response_model=MetricsResponse)

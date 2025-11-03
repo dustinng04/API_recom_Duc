@@ -86,6 +86,51 @@ curl http://localhost:8000/get_metrics?top_k=5
 
 ---
 
+### 3. Re-rank (OpenSearch integration)
+
+Minimal API for combining OpenSearch scores with personalization. The response is a list of scores aligned with the input candidate order (you keep the tutor list and just replace scores or sort by them on the client).
+
+**Endpoint:** `POST /rerank`
+
+**Request:**
+```json
+{
+  "user_id": "<optional-user-id>",
+  "query_vector": [0.12, 0.34],
+  "candidates": [
+    {"tutorId": 101, "os_score": 12.5},
+    {"tutorId": 305, "os_score": 10.1}
+  ]
+}
+```
+
+Notes:
+- query_vector is accepted for future use (query-tutor similarity) but currently unused for simplicity.
+- Scores combine normalized `os_score` (60%) and personalization (40%).
+
+**Response:**
+```json
+{
+  "scores": [0.82, 0.63]
+}
+```
+
+**Curl example:**
+```bash
+curl -X POST "http://localhost:8000/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "e8a9f3b5-4d7c-4e12-8f0a-1b6c7d2e3f4a",
+    "query_vector": [0.1, 0.2, 0.3],
+    "candidates": [
+      {"tutorId": 101, "os_score": 12.5},
+      {"tutorId": 305, "os_score": 10.1}
+    ]
+  }'
+```
+
+---
+
 ### 4. Train Model - Retrain với data mới (Optional)
 
 **Endpoint:** `POST /train`
