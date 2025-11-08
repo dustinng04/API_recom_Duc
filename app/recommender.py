@@ -7,6 +7,13 @@ from typing import List, Dict, Optional, Tuple, Set
 from collections import defaultdict
 import logging
 
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+    lgb = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +35,9 @@ class TutorRecommender:
             'quality': 0.15,
             'popularity': 0.10
         }
+        # Reranker model (LightGBMRanker)
+        self.reranker_model = None
+        self.reranker_metadata = None
 
     def train(
         self, 
@@ -281,7 +291,9 @@ class TutorRecommender:
                 'mlb_subjects': self.mlb_subjects,
                 'mlb_styles': self.mlb_styles,
                 'student_tutor_matrix': self.student_tutor_matrix,
-                'weights': self.weights
+                'weights': self.weights,
+                'reranker_model': self.reranker_model,
+                'reranker_metadata': self.reranker_metadata
             }, f)
         logger.info("Model saved successfully")
 
@@ -299,7 +311,103 @@ class TutorRecommender:
             self.mlb_styles = data['mlb_styles']
             self.student_tutor_matrix = data.get('student_tutor_matrix')
             self.weights = data.get('weights', self.weights)
+            # Load reranker model if available
+            self.reranker_model = data.get('reranker_model')
+            self.reranker_metadata = data.get('reranker_metadata')
+            if self.reranker_model is not None:
+                logger.info("Reranker model loaded successfully")
+            else:
+                logger.info("No reranker model found in saved model")
         logger.info(f"Model loaded: {len(self.tutors_df)} tutors")
+    
+    def load_reranker_model(self, path: str):
+        """
+        Load reranker model from separate file and attach to recommender.
+        
+        Args:
+            path: Path to reranker model file
+        """
+        if not LIGHTGBM_AVAILABLE:
+            logger.warning("LightGBM not available. Cannot load reranker model.")
+            return False
+        
+        try:
+            logger.info(f"Loading reranker model from {path}")
+            with open(path, 'rb') as f:
+                reranker_data = pickle.load(f)
+                self.reranker_model = reranker_data['model']
+                self.reranker_metadata = {
+                    'feature_columns': reranker_data.get('feature_columns'),
+                    'label_column': reranker_data.get('label_column'),
+                    'group_column': reranker_data.get('group_column')
+                }
+            logger.info("Reranker model loaded successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load reranker model: {e}")
+            self.reranker_model = None
+            self.reranker_metadata = None
+            return False
+    
+    def predict_rerank_scores(
+        self,
+        tutor_ids: List[int],
+        rerank_scores: Dict[int, float],
+        tutors_df: Optional[pd.DataFrame] = None
+    ) -> List[float]:
+        """
+        Predict rerank scores using trained LightGBMRanker model.
+        
+        Args:
+            tutor_ids: List of tutor IDs in order
+            rerank_scores: Dict mapping tutor_id -> personalization score
+            tutors_df: Tutors DataFrame (defaults to self.tutors_df)
+        
+        Returns:
+            List of predicted scores in the same order as tutor_ids
+        """
+        if self.reranker_model is None:
+            raise ValueError("Reranker model not loaded. Please train or load a reranker model first.")
+        
+        if tutors_df is None:
+            tutors_df = self.tutors_df
+        
+        if tutors_df is None:
+            raise ValueError("Tutors data not available")
+        
+        # Prepare features for each candidate
+        # Features: [rerank_score, price, rating, position]
+        features_list = []
+        tutors_df_indexed = tutors_df.set_index('id')
+        
+        for idx, tutor_id in enumerate(tutor_ids):
+            # rerank_score: personalization score
+            rerank_score = rerank_scores.get(tutor_id, 0.0)
+            
+            # price, rating: from tutors data
+            if tutor_id in tutors_df_indexed.index:
+                tutor_row = tutors_df_indexed.loc[tutor_id]
+                price = float(tutor_row.get('price', 0))
+                rating = float(tutor_row.get('rating', 0))
+            else:
+                logger.warning(f"Tutor {tutor_id} not found in tutors data, using defaults")
+                price = 0.0
+                rating = 0.0
+            
+            # position: 1-indexed position in the candidate list
+            position = float(idx + 1)
+            
+            # Create feature vector: [rerank_score, price, rating, position]
+            features_list.append([rerank_score, price, rating, position])
+        
+        # Convert to numpy array
+        X = np.array(features_list, dtype=np.float32)
+        
+        # Predict scores using reranker model
+        predicted_scores = self.reranker_model.predict(X)
+        
+        # Convert to list of floats
+        return [float(score) for score in predicted_scores.tolist()]
     
     def evaluate_metrics(self, test_interactions: Optional[List[Dict]] = None, top_k: int = 10) -> Dict:
         """

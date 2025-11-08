@@ -7,8 +7,15 @@ services:
     volumes:
       - ./models:/app/models
       - ./data:/app/data
+      - ./scripts:/app/scripts
     environment:
       - LOG_LEVEL=INFO
+      - OS_HOST=${OS_HOST:-}
+      - OS_USERNAME=${OS_USERNAME:-}
+      - OS_PASSWORD=${OS_PASSWORD:-}
+      - ETL_DATE=${ETL_DATE:-}
+    env_file:
+      - .env
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

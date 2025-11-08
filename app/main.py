@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 import logging
 from datetime import datetime
 import json
+import numpy as np
 from pathlib import Path
 
 from .recommender import TutorRecommender
@@ -82,6 +83,13 @@ async def startup_event():
         if model_path.exists():
             recommender.load_model("models/recommender.pkl")
             logger.info("Existing model loaded successfully")
+            
+            # Try to load reranker model if not already loaded
+            if recommender.reranker_model is None:
+                reranker_path = Path("models/reranker.pkl")
+                if reranker_path.exists():
+                    logger.info("Attempting to load reranker model from separate file...")
+                    recommender.load_reranker_model("models/reranker.pkl")
         else:
             # Load and train with all data sources
             tutors_path = Path("data/tutors_adjust.json")
@@ -117,6 +125,13 @@ async def startup_event():
                           f"{len(interactions_data) if interactions_data else 0} interactions")
             else:
                 logger.warning("No data file found. Model will be empty until /train is called.")
+        
+        # Check reranker model status
+        if recommender.reranker_model is not None:
+            logger.info("Reranker model is available. /rerank-new endpoint is ready.")
+        else:
+            logger.info("No reranker model found. /rerank-new endpoint will use fallback method.")
+            logger.info("Train a reranker model using: python scripts/train_reranker.py")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -148,7 +163,8 @@ async def health_check():
         "tutors_count": len(recommender.tutors_df) if recommender.tutors_df is not None else 0,
         "students_count": len(recommender.students_df) if recommender.students_df is not None else 0,
         "interactions_count": len(recommender.interactions_df) if recommender.interactions_df is not None else 0,
-        "personalization_enabled": recommender.students_df is not None or recommender.interactions_df is not None
+        "personalization_enabled": recommender.students_df is not None or recommender.interactions_df is not None,
+        "reranker_model_loaded": recommender.reranker_model is not None
     }
 
 
@@ -277,6 +293,77 @@ async def rerank(request: RerankRequest):
             status_code=500,
             detail=f"Failed to rerank: {str(e)}"
         )
+
+
+# Re-rank endpoint using trained LightGBMRanker model
+@app.post("/rerank-new", response_model=RerankResponse)
+async def rerank_new(request: RerankRequest):
+    """
+    Re-rank candidates using trained LightGBMRanker model.
+    This endpoint uses a machine learning model trained on historical user interactions
+    to predict optimal ranking scores.
+    
+    If reranker model is not available, falls back to weighted combination method.
+    """
+    try:
+        if recommender is None or recommender.tutors_df is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Recommender model not loaded. Please train the model first using /train endpoint"
+            )
+        
+        # Extract tutor ids in the same order as provided
+        input_ids = [c.tutorId for c in request.candidates]
+        
+        if not input_ids:
+            return RerankResponse(scores=[])
+        
+        # Get personalization scores (rerank_score feature)
+        rec_scores = recommender.score_candidates(user_id=request.user_id, tutor_ids=input_ids)
+        
+        # If reranker model is available, use it
+        if recommender.reranker_model is not None:
+            try:
+                scores = recommender.predict_rerank_scores(
+                    tutor_ids=input_ids,
+                    rerank_scores=rec_scores
+                )
+                return RerankResponse(scores=scores)
+            except Exception as e:
+                logger.warning(f"Reranker model prediction failed, falling back to weighted combination: {e}")
+                # Fall through to weighted combination method
+        
+        # Fallback: Use weighted combination (same as /rerank endpoint)
+        os_map = {c.tutorId: c.os_score for c in request.candidates}
+        os_arr = np.array([os_map.get(tid, 0.0) for tid in input_ids], dtype=float)
+        rec_arr = np.array([rec_scores.get(tid, 0.0) for tid in input_ids], dtype=float)
+        
+        # Per-request min-max normalization to [0,1]
+        def min_max(x: np.ndarray) -> np.ndarray:
+            x_min = float(x.min()) if x.size else 0.0
+            x_max = float(x.max()) if x.size else 0.0
+            if x_max > x_min:
+                return (x - x_min) / (x_max - x_min)
+            return np.zeros_like(x)
+        
+        os_norm = min_max(os_arr)
+        rec_norm = min_max(rec_arr)
+        
+        # Weighted combination (tunable per business needs)
+        w_os, w_rec = 0.6, 0.4
+        final = w_os * os_norm + w_rec * rec_norm
+        
+        return RerankResponse(scores=[float(s) for s in final.tolist()])
+    
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Rerank-new error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to rerank: {str(e)}"
+        )
+
 
 # Get metrics endpoint
 @app.get("/get_metrics", response_model=MetricsResponse)

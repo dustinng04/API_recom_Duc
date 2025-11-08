@@ -1,0 +1,59 @@
+Pipeline ETL để train model re-ranking tích hợp vào API /rerank
+
+Mục đích:
+- Thu thập training data từ search logs và interaction logs
+- Train LightGBMRanker học cách kết hợp os_score với personalization
+- Sau khi train xong, model sẽ được tích hợp vào endpoint /rerank để thay thế weighted combination hiện tại
+
+Bước 1: Extract
+
+a. Search logs (từ OpenSearch)
+- Gọi API _search với index=search-logs-* và filter theo @timestamp (ví dụ 3 ngày gần nhất)
+- Trích xuất: query, sessionId, userId, results[] (danh sách tutor được trả về từ OpenSearch)
+
+b. Interaction logs (từ file CSV/json hoặc database)
+- Đọc vào DataFrame
+- Giữ: userId, tutorId, query, eventType (click/conversion)
+
+Bước 2: Transform
+
+Với mỗi search log:
+1. Expand results[] thành từng dòng (mỗi tutor trong kết quả = 1 dòng)
+2. Merge với interaction_logs theo (userId, tutorId, query) để gán label:
+   - label=1: Có click/conversion (positive)
+   - label=0: Không có interaction (negative)
+
+Features cần thiết cho training (model cần biết để học cách ưu tiên):
+- os_score: Score từ OpenSearch (từ results[])
+- rerank_score: Score từ API /rerank hiện tại (có thể gọi API hoặc tính lại)
+- price: Giá của tutor (từ tutors_adjust.json) - Model cần biết rẻ/đắt
+- rating: Đánh giá của tutor (từ tutors_adjust.json) - Model cần biết cao/thấp
+- position: Vị trí trong kết quả search (1, 2, 3, ...)
+- userId (optional): Để group by query trong LightGBMRanker
+
+Lưu ý: Business rules như price, rating là CẦN THIẾT làm features vì model cần học cách ưu tiên
+tutor rẻ hơn hay đắt hơn, rating cao hay thấp dựa trên user behavior thực tế.
+
+Bước 3: Load
+
+Ghi ra training data:
+- train_data_YYYYMMDD.csv (hoặc Parquet để tiết kiệm dung lượng)
+- Hoặc push vào OpenSearch index train-data-raw để theo dõi và phân tích
+
+Format mỗi dòng:
+userId, query, tutorId, os_score, rerank_score, price, rating, position, label
+
+Bước 4: Automate
+
+Viết script Python chạy hàng ngày (cronjob hoặc GitHub Actions):
+- Lấy search logs mới (gte now-1d/d)
+- Transform và merge với interaction logs
+- Append dữ liệu mới vào Parquet (tích lũy theo thời gian)
+- Sau ~1-3 ngày (hoặc khi đủ data), retrain LightGBMRanker
+
+Bước 5: Training & Integration (sẽ implement sau)
+
+- Train LightGBMRanker với training data đã collect
+- Model học cách combine os_score, rerank_score, price, rating để predict label
+- Sau khi train xong, tích hợp model vào endpoint /rerank để thay thế weighted combination hiện tại
+- Model sẽ tự động học trọng số tốt nhất từ user behavior thực tế
