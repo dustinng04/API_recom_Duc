@@ -299,26 +299,37 @@ class TutorRecommender:
 
     def load_model(self, path: str):
         logger.info(f"Loading model from {path}")
-        with open(path, 'rb') as f:
-            data = pickle.load(f)
-            self.tutors_df = data['tutors_df']
-            self.students_df = data.get('students_df')
-            self.interactions_df = data.get('interactions_df')
-            self.features = data['features']
-            self.similarity_matrix = data['similarity_matrix']
-            self.scaler = data['scaler']
-            self.mlb_subjects = data['mlb_subjects']
-            self.mlb_styles = data['mlb_styles']
-            self.student_tutor_matrix = data.get('student_tutor_matrix')
-            self.weights = data.get('weights', self.weights)
-            # Load reranker model if available
-            self.reranker_model = data.get('reranker_model')
-            self.reranker_metadata = data.get('reranker_metadata')
-            if self.reranker_model is not None:
-                logger.info("Reranker model loaded successfully")
-            else:
-                logger.info("No reranker model found in saved model")
-        logger.info(f"Model loaded: {len(self.tutors_df)} tutors")
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+                self.tutors_df = data['tutors_df']
+                self.students_df = data.get('students_df')
+                self.interactions_df = data.get('interactions_df')
+                self.features = data['features']
+                self.similarity_matrix = data['similarity_matrix']
+                self.scaler = data['scaler']
+                self.mlb_subjects = data['mlb_subjects']
+                self.mlb_styles = data['mlb_styles']
+                self.student_tutor_matrix = data.get('student_tutor_matrix')
+                self.weights = data.get('weights', self.weights)
+                # Load reranker model if available
+                self.reranker_model = data.get('reranker_model')
+                self.reranker_metadata = data.get('reranker_metadata')
+                if self.reranker_model is not None:
+                    logger.info("Reranker model loaded successfully from recommender.pkl")
+                else:
+                    logger.info("No reranker model found in saved model")
+            logger.info(f"Model loaded: {len(self.tutors_df)} tutors")
+        except (ModuleNotFoundError, ImportError) as e:
+            if 'numpy' in str(e) or '_core' in str(e):
+                logger.error(f"NumPy version mismatch error: {e}")
+                logger.error("This usually happens when model was trained with numpy 2.x but loaded with numpy 1.x")
+                logger.error("Solution: Retrain the model with numpy 1.26.4 (same version as in requirements.txt)")
+                raise ValueError(
+                    "NumPy version mismatch. Model was likely trained with numpy 2.x. "
+                    "Please retrain the model with numpy 1.26.4 to match Docker environment."
+                ) from e
+            raise
     
     def load_reranker_model(self, path: str):
         """
@@ -353,6 +364,7 @@ class TutorRecommender:
         self,
         tutor_ids: List[int],
         rerank_scores: Dict[int, float],
+        os_scores: Optional[Dict[int, float]] = None,
         tutors_df: Optional[pd.DataFrame] = None
     ) -> List[float]:
         """
@@ -361,6 +373,7 @@ class TutorRecommender:
         Args:
             tutor_ids: List of tutor IDs in order
             rerank_scores: Dict mapping tutor_id -> personalization score
+            os_scores: Dict mapping tutor_id -> OpenSearch score (optional, defaults to 0.0 if not provided)
             tutors_df: Tutors DataFrame (defaults to self.tutors_df)
         
         Returns:
@@ -376,11 +389,14 @@ class TutorRecommender:
             raise ValueError("Tutors data not available")
         
         # Prepare features for each candidate
-        # Features: [rerank_score, price, rating, position]
+        # Features: [os_score, rerank_score, price, rating, position]
         features_list = []
         tutors_df_indexed = tutors_df.set_index('id')
         
         for idx, tutor_id in enumerate(tutor_ids):
+            # os_score: OpenSearch score (from request)
+            os_score = os_scores.get(tutor_id, 0.0) if os_scores else 0.0
+            
             # rerank_score: personalization score
             rerank_score = rerank_scores.get(tutor_id, 0.0)
             
@@ -397,8 +413,8 @@ class TutorRecommender:
             # position: 1-indexed position in the candidate list
             position = float(idx + 1)
             
-            # Create feature vector: [rerank_score, price, rating, position]
-            features_list.append([rerank_score, price, rating, position])
+            # Create feature vector: [os_score, rerank_score, price, rating, position]
+            features_list.append([os_score, rerank_score, price, rating, position])
         
         # Convert to numpy array
         X = np.array(features_list, dtype=np.float32)
@@ -406,8 +422,20 @@ class TutorRecommender:
         # Predict scores using reranker model
         predicted_scores = self.reranker_model.predict(X)
         
+        # Normalize scores to [0, 1] range using min-max normalization
+        # This ensures scores are always positive and in a consistent range
+        min_score = float(predicted_scores.min())
+        max_score = float(predicted_scores.max())
+        
+        if max_score > min_score:
+            # Normalize: (score - min) / (max - min)
+            normalized_scores = (predicted_scores - min_score) / (max_score - min_score)
+        else:
+            # All scores are the same, return 0.5 for all
+            normalized_scores = np.ones_like(predicted_scores) * 0.5
+        
         # Convert to list of floats
-        return [float(score) for score in predicted_scores.tolist()]
+        return [float(score) for score in normalized_scores.tolist()]
     
     def evaluate_metrics(self, test_interactions: Optional[List[Dict]] = None, top_k: int = 10) -> Dict:
         """

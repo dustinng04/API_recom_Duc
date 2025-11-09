@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Constants
 POSITIVE_EVENT_TYPES = ['click', 'conversion', 'join', 'rating', 'wishlist']
 SEARCH_LOGS_INDEX = 'search-logs-*'
-INTERACTION_LOGS_PATH = Path('data/interaction_logs.jsonl')
+INTERACTION_LOGS_PATH = Path('data/reverse_interaction_logs.jsonl')
 TUTORS_DATA_PATH = Path('data/tutors_adjust.json')
 OUTPUT_DIR = Path('data/training')
 
@@ -99,12 +99,19 @@ def extract_search_logs(client: OpenSearch, date_str: str) -> List[Dict]:
     
     Args:
         client: OpenSearch client
-        date_str: Date in format 'YYYY-MM-DD'
+        date_str: Date in format 'YYYY.MM.DD' (e.g., '2025.11.07')
     
     Returns:
         List of search log documents
     """
     logger.info(f"Extracting search logs for date: {date_str}")
+    
+    # Convert date format from YYYY.MM.DD to YYYY-MM-DD for OpenSearch query
+    # OpenSearch requires ISO 8601 format (with hyphens) for timestamp queries
+    date_iso = date_str.replace('.', '-')
+    
+    # Build index name: search-logs-YYYY.MM.DD (with dots)
+    index_name = f"search-logs-{date_str}"
     
     # Query for search logs on the specified date
     # Note: Adjust timezone if needed (sample shows +07:00)
@@ -112,8 +119,8 @@ def extract_search_logs(client: OpenSearch, date_str: str) -> List[Dict]:
         "query": {
             "range": {
                 "@timestamp": {
-                    "gte": f"{date_str}T00:00:00+07:00",
-                    "lt": f"{date_str}T23:59:59.999999+07:00"
+                    "gte": f"{date_iso}T00:00:00+07:00",
+                    "lt": f"{date_iso}T23:59:59.999999+07:00"
                 }
             }
         },
@@ -125,7 +132,7 @@ def extract_search_logs(client: OpenSearch, date_str: str) -> List[Dict]:
     
     try:
         response = client.search(
-            index=SEARCH_LOGS_INDEX,
+            index=index_name,
             body=query,
             scroll='5m',
             size=scroll_size
@@ -186,6 +193,8 @@ def load_tutors_data() -> Dict[int, Dict]:
     tutors_map = {}
     for tutor in tutors:
         tutor_id = tutor.get('id')
+        tutor_id = int(tutor_id)  # Convert to int
+
         if tutor_id:
             tutors_map[tutor_id] = {
                 'price': tutor.get('price', 0),
@@ -201,7 +210,7 @@ def expand_search_logs(search_logs: List[Dict]) -> pd.DataFrame:
     Expand search logs: each result in results[] becomes one row.
     
     Returns:
-        DataFrame with columns: sessionId, userId, query, tutorId, rerank_score, position
+        DataFrame with columns: sessionId, userId, query, tutorId, os_score, rerank_score, position
     """
     logger.info("Expanding search logs...")
     
@@ -217,7 +226,8 @@ def expand_search_logs(search_logs: List[Dict]) -> pd.DataFrame:
         
         for result in results:
             tutor_id = result.get('tutorId')
-            score = result.get('score')
+            score = result.get('score')  # rerank_score (score sau khi rerank)
+            os_score = result.get('os_score') or result.get('osScore') or 0.0  # os_score từ OpenSearch ban đầu
             rank = result.get('rank')
             
             if tutor_id is not None and score is not None and rank is not None:
@@ -233,11 +243,13 @@ def expand_search_logs(search_logs: List[Dict]) -> pd.DataFrame:
                     'userId': user_id,
                     'query': query,
                     'tutorId': tutor_id,
+                    'os_score': float(os_score),
                     'rerank_score': float(score),
                     'position': int(rank)
                 })
     
     df = pd.DataFrame(expanded_rows)
+    df['tutorId'] = df['tutorId'].astype(int)
     logger.info(f"Expanded to {len(df)} rows from {len(search_logs)} search logs")
     return df
 
@@ -297,6 +309,10 @@ def merge_with_interactions(
         session_id = row['sessionId']
         tutor_id = row['tutorId']
         
+        try:
+            tutor_id = int(tutor_id)
+        except (ValueError, TypeError):
+            return 0
         if session_id in interactions_map:
             if tutor_id in interactions_map[session_id]:
                 return 1
@@ -366,7 +382,10 @@ def save_training_data(df: pd.DataFrame, date_str: str) -> Path:
     output_path = OUTPUT_DIR / filename
     
     # Select and order columns
-    columns = ['userId', 'query', 'tutorId', 'rerank_score', 'price', 'rating', 'position', 'label']
+    columns = ['userId', 'query', 'tutorId', 'os_score', 'rerank_score', 'price', 'rating', 'position', 'label']
+    # Ensure os_score exists, if not create it with default 0.0
+    if 'os_score' not in df.columns:
+        df['os_score'] = 0.0
     df_output = df[columns].copy()
     
     # Save to CSV
@@ -381,10 +400,10 @@ def main():
     logger.info("Starting ETL job...")
     
     # # Get date (today by default, or from environment variable)
-    # date_str = os.getenv('ETL_DATE', datetime.now().strftime('%Y-%m-%d'))
+    # date_str = os.getenv('ETL_DATE', datetime.now().strftime('%Y.%m.%d'))
 
-     # Get date (default: 2025-11-07, or from environment variable, or today)
-    date_str = os.getenv('ETL_DATE', '2025-11-07')
+     # Get date (default: 2025.11.07, or from environment variable, or today)
+    date_str = os.getenv('ETL_DATE', '2025.11.07')
     logger.info(f"Processing data for date: {date_str}")
     
     try:

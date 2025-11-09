@@ -84,12 +84,18 @@ async def startup_event():
             recommender.load_model("models/recommender.pkl")
             logger.info("Existing model loaded successfully")
             
-            # Try to load reranker model if not already loaded
+            # Try to load reranker model from separate file if not already loaded from recommender.pkl
+            # Note: After merging, reranker.pkl can be deleted as it's now in recommender.pkl
             if recommender.reranker_model is None:
                 reranker_path = Path("models/reranker.pkl")
                 if reranker_path.exists():
-                    logger.info("Attempting to load reranker model from separate file...")
-                    recommender.load_reranker_model("models/reranker.pkl")
+                    logger.info("Reranker model not found in recommender.pkl. Attempting to load from separate file...")
+                    logger.info("Tip: Run 'python scripts/merge_reranker.py' to merge reranker into recommender.pkl")
+                    try:
+                        recommender.load_reranker_model("models/reranker.pkl")
+                    except Exception as e:
+                        logger.warning(f"Failed to load reranker from separate file: {e}")
+                        logger.info("Reranker model will not be available. API /rerank-new will use fallback method.")
         else:
             # Load and train with all data sources
             tutors_path = Path("data/tutors_adjust.json")
@@ -303,13 +309,25 @@ async def rerank_new(request: RerankRequest):
     This endpoint uses a machine learning model trained on historical user interactions
     to predict optimal ranking scores.
     
-    If reranker model is not available, falls back to weighted combination method.
+    This endpoint REQUIRES a trained reranker model. If model is not available, returns 503 error.
+    Use /rerank endpoint for weighted combination method.
     """
     try:
         if recommender is None or recommender.tutors_df is None:
             raise HTTPException(
                 status_code=503,
                 detail="Recommender model not loaded. Please train the model first using /train endpoint"
+            )
+        
+        # Check if reranker model is available
+        if recommender.reranker_model is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Reranker model not available. Please train the reranker model first using: "
+                    "python scripts/train_reranker.py. "
+                    "Alternatively, use /rerank endpoint for weighted combination method."
+                )
             )
         
         # Extract tutor ids in the same order as provided
@@ -321,39 +339,23 @@ async def rerank_new(request: RerankRequest):
         # Get personalization scores (rerank_score feature)
         rec_scores = recommender.score_candidates(user_id=request.user_id, tutor_ids=input_ids)
         
-        # If reranker model is available, use it
-        if recommender.reranker_model is not None:
-            try:
-                scores = recommender.predict_rerank_scores(
-                    tutor_ids=input_ids,
-                    rerank_scores=rec_scores
-                )
-                return RerankResponse(scores=scores)
-            except Exception as e:
-                logger.warning(f"Reranker model prediction failed, falling back to weighted combination: {e}")
-                # Fall through to weighted combination method
-        
-        # Fallback: Use weighted combination (same as /rerank endpoint)
+        # Extract os_score from request candidates
         os_map = {c.tutorId: c.os_score for c in request.candidates}
-        os_arr = np.array([os_map.get(tid, 0.0) for tid in input_ids], dtype=float)
-        rec_arr = np.array([rec_scores.get(tid, 0.0) for tid in input_ids], dtype=float)
         
-        # Per-request min-max normalization to [0,1]
-        def min_max(x: np.ndarray) -> np.ndarray:
-            x_min = float(x.min()) if x.size else 0.0
-            x_max = float(x.max()) if x.size else 0.0
-            if x_max > x_min:
-                return (x - x_min) / (x_max - x_min)
-            return np.zeros_like(x)
-        
-        os_norm = min_max(os_arr)
-        rec_norm = min_max(rec_arr)
-        
-        # Weighted combination (tunable per business needs)
-        w_os, w_rec = 0.6, 0.4
-        final = w_os * os_norm + w_rec * rec_norm
-        
-        return RerankResponse(scores=[float(s) for s in final.tolist()])
+        # Predict using reranker model
+        try:
+            scores = recommender.predict_rerank_scores(
+                tutor_ids=input_ids,
+                rerank_scores=rec_scores,
+                os_scores=os_map
+            )
+            return RerankResponse(scores=scores)
+        except Exception as e:
+            logger.error(f"Reranker model prediction failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to predict rerank scores: {str(e)}. Please check model and input data."
+            )
     
     except HTTPException as he:
         raise he

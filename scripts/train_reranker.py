@@ -31,7 +31,7 @@ MODEL_DIR = Path('models')
 MODEL_PATH = MODEL_DIR / 'reranker.pkl'
 
 # Features to use for training
-FEATURE_COLUMNS = ['rerank_score', 'price', 'rating', 'position']
+FEATURE_COLUMNS = ['os_score', 'rerank_score', 'price', 'rating', 'position']
 LABEL_COLUMN = 'label'
 GROUP_COLUMN = 'query'  # Group by query for learning-to-rank
 
