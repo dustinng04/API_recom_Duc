@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 import logging
 from datetime import datetime
 import json
+import numpy as np
 from pathlib import Path
 
 from .recommender import TutorRecommender
@@ -82,6 +83,19 @@ async def startup_event():
         if model_path.exists():
             recommender.load_model("models/recommender.pkl")
             logger.info("Existing model loaded successfully")
+            
+            # Try to load reranker model from separate file if not already loaded from recommender.pkl
+            # Note: After merging, reranker.pkl can be deleted as it's now in recommender.pkl
+            if recommender.reranker_model is None:
+                reranker_path = Path("models/reranker.pkl")
+                if reranker_path.exists():
+                    logger.info("Reranker model not found in recommender.pkl. Attempting to load from separate file...")
+                    logger.info("Tip: Run 'python scripts/merge_reranker.py' to merge reranker into recommender.pkl")
+                    try:
+                        recommender.load_reranker_model("models/reranker.pkl")
+                    except Exception as e:
+                        logger.warning(f"Failed to load reranker from separate file: {e}")
+                        logger.info("Reranker model will not be available. API /rerank-new will use fallback method.")
         else:
             # Load and train with all data sources
             tutors_path = Path("data/tutors_adjust.json")
@@ -117,6 +131,13 @@ async def startup_event():
                           f"{len(interactions_data) if interactions_data else 0} interactions")
             else:
                 logger.warning("No data file found. Model will be empty until /train is called.")
+        
+        # Check reranker model status
+        if recommender.reranker_model is not None:
+            logger.info("Reranker model is available. /rerank-new endpoint is ready.")
+        else:
+            logger.info("No reranker model found. /rerank-new endpoint will use fallback method.")
+            logger.info("Train a reranker model using: python scripts/train_reranker.py")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")
@@ -148,7 +169,8 @@ async def health_check():
         "tutors_count": len(recommender.tutors_df) if recommender.tutors_df is not None else 0,
         "students_count": len(recommender.students_df) if recommender.students_df is not None else 0,
         "interactions_count": len(recommender.interactions_df) if recommender.interactions_df is not None else 0,
-        "personalization_enabled": recommender.students_df is not None or recommender.interactions_df is not None
+        "personalization_enabled": recommender.students_df is not None or recommender.interactions_df is not None,
+        "reranker_model_loaded": recommender.reranker_model is not None
     }
 
 
@@ -277,6 +299,73 @@ async def rerank(request: RerankRequest):
             status_code=500,
             detail=f"Failed to rerank: {str(e)}"
         )
+
+
+# Re-rank endpoint using trained LightGBMRanker model
+@app.post("/rerank-new", response_model=RerankResponse)
+async def rerank_new(request: RerankRequest):
+    """
+    Re-rank candidates using trained LightGBMRanker model.
+    This endpoint uses a machine learning model trained on historical user interactions
+    to predict optimal ranking scores.
+    
+    This endpoint REQUIRES a trained reranker model. If model is not available, returns 503 error.
+    Use /rerank endpoint for weighted combination method.
+    """
+    try:
+        if recommender is None or recommender.tutors_df is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Recommender model not loaded. Please train the model first using /train endpoint"
+            )
+        
+        # Check if reranker model is available
+        if recommender.reranker_model is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Reranker model not available. Please train the reranker model first using: "
+                    "python scripts/train_reranker.py. "
+                    "Alternatively, use /rerank endpoint for weighted combination method."
+                )
+            )
+        
+        # Extract tutor ids in the same order as provided
+        input_ids = [c.tutorId for c in request.candidates]
+        
+        if not input_ids:
+            return RerankResponse(scores=[])
+        
+        # Get personalization scores (rerank_score feature)
+        rec_scores = recommender.score_candidates(user_id=request.user_id, tutor_ids=input_ids)
+        
+        # Extract os_score from request candidates
+        os_map = {c.tutorId: c.os_score for c in request.candidates}
+        
+        # Predict using reranker model
+        try:
+            scores = recommender.predict_rerank_scores(
+                tutor_ids=input_ids,
+                rerank_scores=rec_scores,
+                os_scores=os_map
+            )
+            return RerankResponse(scores=scores)
+        except Exception as e:
+            logger.error(f"Reranker model prediction failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to predict rerank scores: {str(e)}. Please check model and input data."
+            )
+    
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Rerank-new error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to rerank: {str(e)}"
+        )
+
 
 # Get metrics endpoint
 @app.get("/get_metrics", response_model=MetricsResponse)

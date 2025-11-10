@@ -131,6 +131,52 @@ curl -X POST "http://localhost:8000/rerank" \
 
 ---
 
+### 3.1. Re-rank với ML Model (NEW)
+
+**Endpoint:** `POST /rerank-new`
+
+Sử dụng LightGBMRanker model đã được train để predict ranking scores. Model học từ user behavior thực tế để optimize ranking.
+
+**Request:** (Giống như `/rerank`)
+```json
+{
+  "user_id": "<optional-user-id>",
+  "query_vector": [0.12, 0.34],
+  "candidates": [
+    {"tutorId": 101, "os_score": 12.5},
+    {"tutorId": 305, "os_score": 10.1}
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "scores": [0.85, 0.72]
+}
+```
+
+**Curl example:**
+```bash
+curl -X POST "http://localhost:8000/rerank-new" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "e8a9f3b5-4d7c-4e12-8f0a-1b6c7d2e3f4a",
+    "query_vector": [0.1, 0.2, 0.3],
+    "candidates": [
+      {"tutorId": 101, "os_score": 12.5},
+      {"tutorId": 305, "os_score": 10.1}
+    ]
+  }'
+```
+
+**Lưu ý:**
+- Model cần được train trước bằng: `python scripts/train_reranker.py`
+- Model sử dụng features: rerank_score (personalization), price, rating, position
+- Model tự động học trọng số tốt nhất từ user behavior
+
+---
+
 ### 4. Train Model - Retrain với data mới (Optional)
 
 **Endpoint:** `POST /train`
