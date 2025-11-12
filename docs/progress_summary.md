@@ -112,8 +112,7 @@
 3. **Tích hợp model vào `/rerank` chính** - Thay thế weighted combination
 4. **Feature normalization** - Xem xét normalize features khi predict để đảm bảo scale consistency
 5. **Setup automation** - Cronjob/GitHub Actions để chạy ETL hàng ngày
-6. **Parquet support** - Để tiết kiệm dung lượng và tăng tốc độ
-7. **Data accumulation** - Append data mới vào file tích lũy thay vì overwrite
+6. **Data accumulation** - Append data mới vào file tích lũy thay vì overwrite
 
 ## 📝 CẬP NHẬT GẦN ĐÂY
 

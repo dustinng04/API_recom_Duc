@@ -3,8 +3,8 @@
 ETL Job for training data collection from search logs and interaction logs.
 
 This script:
-1. Extracts search logs from OpenSearch (today's data)
-2. Loads interaction logs from local file
+1. Extracts search logs from OpenSearch (multiple days)
+2. Extracts interaction logs from OpenSearch (matching date range)
 3. Loads tutors data from local file
 4. Transforms and merges data
 5. Outputs training data as CSV
@@ -31,17 +31,15 @@ logger = logging.getLogger(__name__)
 
 # Constants
 POSITIVE_EVENT_TYPES = ['click', 'conversion', 'join', 'rating', 'wishlist']
-SEARCH_LOGS_INDEX = 'search-logs-*'
-INTERACTION_LOGS_PATH = Path('data/reverse_interaction_logs.jsonl')
+SEARCH_LOGS_INDEX_PATTERN = 'search-logs-*'
+INTERACTION_LOGS_INDEX_PATTERN = 'interaction-logs-*'  # Assumed index pattern
 TUTORS_DATA_PATH = Path('data/tutors_adjust.json')
 OUTPUT_DIR = Path('data/training')
 
 
 def get_opensearch_client() -> OpenSearch:
-
-    load_dotenv()
-    print("DEBUG:", os.getenv("OS_HOST"), os.getenv("OS_USERNAME"))
     """Initialize OpenSearch client from environment variables."""
+    load_dotenv()
     host = os.getenv('OS_HOST')
     username = os.getenv('OS_USERNAME')
     password = os.getenv('OS_PASSWORD')
@@ -152,31 +150,115 @@ def extract_search_logs(client: OpenSearch, date_str: str) -> List[Dict]:
                 all_logs.extend([hit['_source'] for hit in hits])
                 logger.info(f"Scroll batch: {len(hits)} logs")
         
-        logger.info(f"Total search logs extracted: {len(all_logs)}")
+        logger.info(f"Total search logs extracted for {date_str}: {len(all_logs)}")
         return all_logs
     
     except Exception as e:
-        logger.error(f"Error extracting search logs: {e}")
-        raise
+        logger.error(f"Error extracting search logs for {date_str}: {e}")
+        # Return empty list instead of raising to allow processing other dates
+        return []
 
 
-def load_interaction_logs() -> pd.DataFrame:
-    """Load interaction logs from local file."""
-    logger.info(f"Loading interaction logs from {INTERACTION_LOGS_PATH}")
+def extract_search_logs_multi_days(client: OpenSearch, date_list: List[str]) -> List[Dict]:
+    """
+    Extract search logs from OpenSearch for multiple dates.
     
-    if not INTERACTION_LOGS_PATH.exists():
-        logger.warning(f"Interaction logs file not found: {INTERACTION_LOGS_PATH}")
+    Args:
+        client: OpenSearch client
+        date_list: List of dates in format 'YYYY.MM.DD'
+    
+    Returns:
+        List of search log documents from all dates
+    """
+    logger.info(f"Extracting search logs for {len(date_list)} days: {date_list}")
+    
+    all_logs = []
+    for date_str in date_list:
+        logs = extract_search_logs(client, date_str)
+        all_logs.extend(logs)
+    
+    logger.info(f"Total search logs extracted across all dates: {len(all_logs)}")
+    return all_logs
+
+
+def extract_interaction_logs(client: OpenSearch, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Extract interaction logs from OpenSearch for a date range.
+    
+    Args:
+        client: OpenSearch client
+        start_date: Start date in format 'YYYY-MM-DD' (ISO format)
+        end_date: End date in format 'YYYY-MM-DD' (ISO format, exclusive)
+    
+    Returns:
+        DataFrame with interaction logs
+    """
+    logger.info(f"Extracting interaction logs from {start_date} to {end_date}")
+    
+    # Query for interaction logs in the date range
+    # Note: Adjust timezone if needed (sample shows +07:00)
+    # Using timestamp field (ISO format) or @timestamp
+    query = {
+        "query": {
+            "bool": {
+                "should": [
+                    {
+                        "range": {
+                            "@timestamp": {
+                                "gte": f"{start_date}T00:00:00+07:00",
+                                "lt": f"{end_date}T23:59:59.999999+07:00"
+                            }
+                        }
+                    },
+                    {
+                        "range": {
+                            "timestamp": {
+                                "gte": f"{start_date}T00:00:00+07:00",
+                                "lt": f"{end_date}T23:59:59.999999+07:00"
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "size": 10000
+    }
+    
+    all_logs = []
+    scroll_size = 10000
+    
+    try:
+        response = client.search(
+            index=INTERACTION_LOGS_INDEX_PATTERN,
+            body=query,
+            scroll='5m',
+            size=scroll_size
+        )
+        
+        scroll_id = response.get('_scroll_id')
+        hits = response['hits']['hits']
+        all_logs.extend([hit['_source'] for hit in hits])
+        logger.info(f"Initial batch: {len(hits)} interaction logs")
+        
+        # Continue scrolling if there are more results
+        while len(hits) > 0:
+            response = client.scroll(scroll_id=scroll_id, scroll='5m')
+            scroll_id = response.get('_scroll_id')
+            hits = response['hits']['hits']
+            if hits:
+                all_logs.extend([hit['_source'] for hit in hits])
+                logger.info(f"Scroll batch: {len(hits)} interaction logs")
+        
+        df = pd.DataFrame(all_logs)
+        logger.info(f"Total interaction logs extracted: {len(df)}")
+        return df
+    
+    except Exception as e:
+        logger.error(f"Error extracting interaction logs: {e}")
+        logger.warning("Returning empty DataFrame. Check if interaction-logs-* index exists.")
         return pd.DataFrame()
-    
-    interactions = []
-    with open(INTERACTION_LOGS_PATH, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.strip():
-                interactions.append(json.loads(line))
-    
-    df = pd.DataFrame(interactions)
-    logger.info(f"Loaded {len(df)} interactions")
-    return df
+
+
 
 
 def load_tutors_data() -> Dict[int, Dict]:
@@ -399,60 +481,100 @@ def main():
     """Main ETL job execution."""
     logger.info("Starting ETL job...")
     
-    # # Get date (today by default, or from environment variable)
-    # date_str = os.getenv('ETL_DATE', datetime.now().strftime('%Y.%m.%d'))
-
-     # Get date (default: 2025.11.07, or from environment variable, or today)
-    date_str = os.getenv('ETL_DATE', '2025.11.07')
-    logger.info(f"Processing data for date: {date_str}")
+    # Get number of days to process (default: 1 day)
+    num_days = int(os.getenv('ETL_NUM_DAYS', '1'))
+    
+    # Get number of days to look back (default: 3 days before base_date)
+    days_lookback = int(os.getenv('ETL_DAYS_LOOKBACK', '3'))
+    
+    # Get base date (today by default, or from environment variable)
+    base_date_str = os.getenv('ETL_DATE', None)
+    if base_date_str:
+        # Parse provided date
+        try:
+            base_date = datetime.strptime(base_date_str, '%Y.%m.%d')
+        except ValueError:
+            try:
+                base_date = datetime.strptime(base_date_str, '%Y-%m-%d')
+            except ValueError:
+                logger.error(f"Invalid date format: {base_date_str}. Use YYYY.MM.DD or YYYY-MM-DD")
+                return
+    else:
+        # Use today
+        base_date = datetime.now()
+    
+    # Calculate target date: days_lookback days before base_date
+    target_date = base_date - timedelta(days=days_lookback)
+    
+    # Generate list of dates to process (num_days going backwards from target_date)
+    date_list = []
+    for i in range(num_days):
+        date = target_date - timedelta(days=i)
+        date_str = date.strftime('%Y.%m.%d')
+        date_list.append(date_str)
+    
+    logger.info(f"Base date: {base_date.strftime('%Y.%m.%d')}")
+    logger.info(f"Target date (lookback {days_lookback} days): {target_date.strftime('%Y.%m.%d')}")
+    logger.info(f"Processing data for {num_days} day(s): {date_list}")
+    
+    # Calculate date range for interaction logs (start = oldest, end = newest + 1 day)
+    start_date_iso = (target_date - timedelta(days=num_days-1)).strftime('%Y-%m-%d')
+    end_date_iso = (target_date + timedelta(days=1)).strftime('%Y-%m-%d')
     
     try:
-        # Step 1: Extract search logs from OpenSearch
+        # Step 1: Initialize OpenSearch client
         client = get_opensearch_client()
-        search_logs = extract_search_logs(client, date_str)
+        
+        # Step 2: Extract search logs from OpenSearch (multiple days)
+        search_logs = extract_search_logs_multi_days(client, date_list)
         
         if not search_logs:
             logger.warning("No search logs found. Exiting.")
             return
         
-        # Step 2: Load interaction logs
-        interactions_df = load_interaction_logs()
+        # Step 3: Extract interaction logs from OpenSearch (matching date range)
+        interactions_df = extract_interaction_logs(client, start_date_iso, end_date_iso)
         
-        # Step 3: Load tutors data
+        if interactions_df.empty:
+            logger.warning("No interaction logs found. Training data will have all negative labels.")
+        
+        # Step 4: Load tutors data
         tutors_map = load_tutors_data()
         
         if not tutors_map:
             logger.error("No tutors data loaded. Cannot proceed.")
             return
         
-        # Step 4: Expand search logs
+        # Step 5: Expand search logs
         search_df = expand_search_logs(search_logs)
         
         if search_df.empty:
             logger.warning("No valid search logs after expansion. Exiting.")
             return
         
-        # Step 5: Aggregate interactions
+        # Step 6: Aggregate interactions
         interactions_map = aggregate_interactions(interactions_df)
         
-        # Step 6: Merge with interactions to assign labels
+        # Step 7: Merge with interactions to assign labels
         search_df = merge_with_interactions(search_df, interactions_map)
         
-        # Step 7: Map tutors data
+        # Step 8: Map tutors data
         search_df = map_tutors_data(search_df, tutors_map)
         
         if search_df.empty:
             logger.warning("No training data after mapping tutors. Exiting.")
             return
         
-        # Step 8: Save training data
-        output_path = save_training_data(search_df, date_str)
+        # Step 9: Save training data (use target date for filename)
+        target_date_str = target_date.strftime('%Y.%m.%d')
+        output_path = save_training_data(search_df, target_date_str)
         
         logger.info("ETL job completed successfully!")
         logger.info(f"Output: {output_path}")
         logger.info(f"Total rows: {len(search_df)}")
         logger.info(f"Positive labels: {search_df['label'].sum()}")
         logger.info(f"Negative labels: {(search_df['label'] == 0).sum()}")
+        logger.info(f"Date range processed: {date_list}")
     
     except Exception as e:
         logger.error(f"ETL job failed: {e}", exc_info=True)

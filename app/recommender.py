@@ -317,6 +317,10 @@ class TutorRecommender:
                 self.reranker_metadata = data.get('reranker_metadata')
                 if self.reranker_model is not None:
                     logger.info("Reranker model loaded successfully from recommender.pkl")
+                    if self.reranker_metadata and 'scaler' in self.reranker_metadata:
+                        logger.info("Reranker scaler found in metadata")
+                    else:
+                        logger.warning("Reranker scaler not found in metadata. Features will not be scaled.")
                 else:
                     logger.info("No reranker model found in saved model")
             logger.info(f"Model loaded: {len(self.tutors_df)} tutors")
@@ -348,11 +352,16 @@ class TutorRecommender:
                 reranker_data = pickle.load(f)
                 self.reranker_model = reranker_data['model']
                 self.reranker_metadata = {
+                    'scaler': reranker_data.get('scaler'),
                     'feature_columns': reranker_data.get('feature_columns'),
                     'label_column': reranker_data.get('label_column'),
                     'group_column': reranker_data.get('group_column')
                 }
             logger.info("Reranker model loaded successfully")
+            if self.reranker_metadata.get('scaler') is not None:
+                logger.info("Reranker scaler loaded successfully")
+            else:
+                logger.warning("Reranker scaler not found. Features will not be scaled.")
             return True
         except Exception as e:
             logger.warning(f"Failed to load reranker model: {e}")
@@ -418,6 +427,13 @@ class TutorRecommender:
         
         # Convert to numpy array
         X = np.array(features_list, dtype=np.float32)
+        
+        # Apply scaler if available (to match training data scale)
+        if self.reranker_metadata and 'scaler' in self.reranker_metadata:
+            scaler = self.reranker_metadata['scaler']
+            if scaler is not None:
+                X = scaler.transform(X)
+                logger.debug("Features scaled using StandardScaler")
         
         # Predict scores using reranker model
         predicted_scores = self.reranker_model.predict(X)

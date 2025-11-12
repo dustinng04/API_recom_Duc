@@ -60,6 +60,7 @@ def merge_reranker_into_recommender(
         
         reranker_model = reranker_data.get('model')
         reranker_metadata = {
+            'scaler': reranker_data.get('scaler'),
             'feature_columns': reranker_data.get('feature_columns'),
             'label_column': reranker_data.get('label_column'),
             'group_column': reranker_data.get('group_column')

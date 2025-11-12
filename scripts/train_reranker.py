@@ -15,8 +15,9 @@ import lightgbm as lgb
 import pickle
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 import argparse
+from sklearn.preprocessing import StandardScaler
 
 # Setup logging
 logging.basicConfig(
@@ -88,9 +89,9 @@ def train_model(
     y: np.ndarray,
     groups: np.ndarray,
     test_size: float = 0.2
-) -> lgb.Booster:
+) -> Tuple[lgb.Booster, StandardScaler]:
     """
-    Train LightGBMRanker model.
+    Train LightGBMRanker model with feature scaling.
     
     Args:
         X: Feature matrix
@@ -99,7 +100,7 @@ def train_model(
         test_size: Fraction of data to use for validation
     
     Returns:
-        Trained LightGBM model
+        Tuple of (Trained LightGBM model, StandardScaler fitted on training data)
     """
     logger.info("Training LightGBMRanker model...")
     
@@ -123,6 +124,16 @@ def train_model(
     logger.info(f"Train: {len(X_train)} samples in {len(groups_train)} groups")
     logger.info(f"Validation: {len(X_val)} samples in {len(groups_val)} groups")
     
+    # Fit scaler on training data only
+    logger.info("Fitting StandardScaler on training data...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    
+    logger.info("Feature scaling completed. Mean: {}, Std: {}".format(
+        scaler.mean_.round(4), scaler.scale_.round(4)
+    ))
+    
     # LightGBM parameters for ranking
     params = {
         'objective': 'lambdarank',
@@ -138,15 +149,15 @@ def train_model(
         'num_threads': -1,
     }
     
-    # Create datasets
+    # Create datasets with scaled features
     train_data = lgb.Dataset(
-        X_train,
+        X_train_scaled,
         label=y_train,
         group=groups_train
     )
     
     val_data = lgb.Dataset(
-        X_val,
+        X_val_scaled,
         label=y_val,
         group=groups_val,
         reference=train_data
@@ -167,12 +178,17 @@ def train_model(
     
     logger.info("Model training completed!")
     
-    return model
+    return model, scaler
 
 
-def save_model(model: lgb.Booster, model_path: Path, update_recommender: bool = True):
+def save_model(
+    model: lgb.Booster,
+    scaler: StandardScaler,
+    model_path: Path,
+    update_recommender: bool = True
+):
     """
-    Save trained model to disk.
+    Save trained model and scaler to disk.
     If update_recommender is True, also update the main recommender model file.
     """
     logger.info(f"Saving model to {model_path}")
@@ -183,6 +199,7 @@ def save_model(model: lgb.Booster, model_path: Path, update_recommender: bool = 
     with open(model_path, 'wb') as f:
         pickle.dump({
             'model': model,
+            'scaler': scaler,
             'feature_columns': FEATURE_COLUMNS,
             'label_column': LABEL_COLUMN,
             'group_column': GROUP_COLUMN
@@ -199,9 +216,10 @@ def save_model(model: lgb.Booster, model_path: Path, update_recommender: bool = 
                 with open(recommender_path, 'rb') as f:
                     recommender_data = pickle.load(f)
                 
-                # Add reranker model to recommender data
+                # Add reranker model and scaler to recommender data
                 recommender_data['reranker_model'] = model
                 recommender_data['reranker_metadata'] = {
+                    'scaler': scaler,
                     'feature_columns': FEATURE_COLUMNS,
                     'label_column': LABEL_COLUMN,
                     'group_column': GROUP_COLUMN
@@ -253,11 +271,11 @@ def main():
         # Prepare features
         X, y, groups = prepare_features(df)
         
-        # Train model
-        model = train_model(X, y, groups, test_size=args.test_size)
+        # Train model (returns model and scaler)
+        model, scaler = train_model(X, y, groups, test_size=args.test_size)
         
-        # Save model
-        save_model(model, MODEL_PATH)
+        # Save model and scaler
+        save_model(model, scaler, MODEL_PATH)
         
         logger.info("Training completed successfully!")
         logger.info(f"Model saved to: {MODEL_PATH}")
