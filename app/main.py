@@ -81,8 +81,9 @@ async def startup_event():
         # Try to load existing model
         model_path = Path("models/recommender.pkl")
         if model_path.exists():
+            logger.info(f"Found existing model at {model_path}")
             recommender.load_model("models/recommender.pkl")
-            logger.info("Existing model loaded successfully")
+            logger.info("Existing recommender model loaded successfully")
             
             # Try to load reranker model from separate file if not already loaded from recommender.pkl
             # Note: After merging, reranker.pkl can be deleted as it's now in recommender.pkl
@@ -90,12 +91,18 @@ async def startup_event():
                 reranker_path = Path("models/reranker.pkl")
                 if reranker_path.exists():
                     logger.info("Reranker model not found in recommender.pkl. Attempting to load from separate file...")
+                    logger.info(f"Found reranker model at {reranker_path}")
                     logger.info("Tip: Run 'python scripts/merge_reranker.py' to merge reranker into recommender.pkl")
                     try:
                         recommender.load_reranker_model("models/reranker.pkl")
+                        logger.info("Reranker model loaded successfully from separate file")
                     except Exception as e:
-                        logger.warning(f"Failed to load reranker from separate file: {e}")
-                        logger.info("Reranker model will not be available. API /rerank-new will use fallback method.")
+                        logger.error(f"Failed to load reranker from separate file: {e}", exc_info=True)
+                        logger.warning("Reranker model will not be available. API /rerank-new will use fallback method.")
+                else:
+                    logger.info(f"Reranker model file not found at {reranker_path}")
+            else:
+                logger.info("Reranker model already loaded from recommender.pkl")
         else:
             # Load and train with all data sources
             tutors_path = Path("data/tutors_adjust.json")
@@ -103,7 +110,8 @@ async def startup_event():
             interactions_path = Path("data/interaction_logs.jsonl")
             
             if tutors_path.exists():
-                logger.info("No existing model found. Training with all available data...")
+                logger.warning(f"No existing recommender model found at {model_path}")
+                logger.info("Training new recommender model with all available data...")
                 
                 # Load tutors
                 with open(tutors_path, 'r', encoding='utf-8') as f:
@@ -126,18 +134,33 @@ async def startup_event():
                 # Train with all data
                 recommender.train(tutors_data, students_data, interactions_data)
                 recommender.save_model("models/recommender.pkl")
-                logger.info(f"Model trained with {len(tutors_data)} tutors, "
+                logger.info(f"Recommender model trained and saved with {len(tutors_data)} tutors, "
                           f"{len(students_data) if students_data else 0} students, "
                           f"{len(interactions_data) if interactions_data else 0} interactions")
+                
+                # After training recommender, try to load reranker if it exists
+                reranker_path = Path("models/reranker.pkl")
+                if reranker_path.exists():
+                    logger.info(f"Found reranker model at {reranker_path}. Attempting to load...")
+                    try:
+                        recommender.load_reranker_model("models/reranker.pkl")
+                        logger.info("Reranker model loaded successfully after recommender training")
+                    except Exception as e:
+                        logger.warning(f"Failed to load reranker model: {e}")
             else:
                 logger.warning("No data file found. Model will be empty until /train is called.")
         
         # Check reranker model status
         if recommender.reranker_model is not None:
-            logger.info("Reranker model is available. /rerank-new endpoint is ready.")
+            logger.info("✓ Reranker model is available. /rerank-new endpoint is ready.")
+            if recommender.reranker_metadata and recommender.reranker_metadata.get('scaler'):
+                logger.info("✓ Reranker scaler is available. Features will be normalized.")
+            else:
+                logger.warning("⚠ Reranker scaler not found. Features will not be normalized.")
         else:
-            logger.info("No reranker model found. /rerank-new endpoint will use fallback method.")
-            logger.info("Train a reranker model using: python scripts/train_reranker.py")
+            logger.warning("✗ No reranker model found. /rerank-new endpoint will return 503 error.")
+            logger.info("To train a reranker model, run: python scripts/train_reranker.py")
+            logger.info("Or use /rerank endpoint for weighted combination method.")
 
     except Exception as e:
         logger.error(f"Error during startup: {e}")

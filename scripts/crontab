@@ -1,0 +1,17 @@
+# ETL and Training Cron Jobs
+# Format: minute hour day month weekday command
+# Note: Environment variables from .env file need to be loaded in the script
+
+# Run ETL job daily at 2:00 AM
+# This will extract data from 3 days ago (default ETL_DAYS_LOOKBACK=3)
+# Using bash -c to ensure proper environment and shell execution
+0 2 * * * root bash -c "cd /app && /app/scripts/run_etl_and_train.sh"
+
+# Optional: Run ETL job at a different time (uncomment if needed)
+# 0 3 * * * root /app/scripts/run_etl_and_train.sh
+
+# Note: The script run_etl_and_train.sh will:
+# 1. Run ETL job to extract and process data
+# 2. If ETL succeeds, automatically run training
+# 3. Log everything to /var/log/etl/etl_and_train_YYYYMMDD_HHMMSS.log
+

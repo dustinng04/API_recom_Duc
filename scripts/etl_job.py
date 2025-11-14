@@ -3,11 +3,12 @@
 ETL Job for training data collection from search logs and interaction logs.
 
 This script:
-1. Extracts search logs from OpenSearch (multiple days)
-2. Extracts interaction logs from OpenSearch (matching date range)
+1. Extracts search logs from OpenSearch (multiple days, uses @timestamp)
+2. Extracts interaction logs from OpenSearch (matching date range, uses timestamp)
 3. Loads tutors data from local file
 4. Transforms and merges data
-5. Outputs training data as CSV
+5. Outputs training data as CSV (primary storage)
+6. Pushes training data to OpenSearch index for monitoring (optional)
 """
 
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Set
 from opensearchpy import OpenSearch
+from opensearchpy.helpers import bulk
 from collections import defaultdict
 
 # Setup logging
@@ -196,29 +198,15 @@ def extract_interaction_logs(client: OpenSearch, start_date: str, end_date: str)
     logger.info(f"Extracting interaction logs from {start_date} to {end_date}")
     
     # Query for interaction logs in the date range
-    # Note: Adjust timezone if needed (sample shows +07:00)
-    # Using timestamp field (ISO format) or @timestamp
+    # Note: Using timestamp field (not @timestamp) for interaction logs
+    # Adjust timezone if needed (sample shows +07:00)
     query = {
         "query": {
-            "bool": {
-                "should": [
-                    {
-                        "range": {
-                            "@timestamp": {
-                                "gte": f"{start_date}T00:00:00+07:00",
-                                "lt": f"{end_date}T23:59:59.999999+07:00"
-                            }
-                        }
-                    },
-                    {
-                        "range": {
-                            "timestamp": {
-                                "gte": f"{start_date}T00:00:00+07:00",
-                                "lt": f"{end_date}T23:59:59.999999+07:00"
-                            }
-                        }
-                    }
-                ]
+            "range": {
+                "timestamp": {
+                    "gte": f"{start_date}T00:00:00+07:00",
+                    "lt": f"{end_date}T23:59:59.999999+07:00"
+                }
             }
         },
         "size": 10000
@@ -477,6 +465,56 @@ def save_training_data(df: pd.DataFrame, date_str: str) -> Path:
     return output_path
 
 
+def save_training_data_to_opensearch(
+    client: OpenSearch,
+    df: pd.DataFrame,
+    date_str: str
+) -> None:
+    """
+    Push training data to OpenSearch index for monitoring and analytics.
+    
+    Args:
+        client: OpenSearch client
+        df: Training DataFrame
+        date_str: Date string for index name (YYYY.MM.DD format)
+    """
+    logger.info(f"Pushing training data to OpenSearch index for date: {date_str}")
+    
+    index_name = f"train-data-raw-{date_str}"
+    
+    # Select and order columns (same as CSV output)
+    columns = ['userId', 'query', 'tutorId', 'os_score', 'rerank_score', 'price', 'rating', 'position', 'label']
+    df_output = df[columns].copy()
+    
+    # Convert DataFrame to list of dicts
+    records = df_output.to_dict('records')
+    
+    # Prepare bulk actions
+    actions = [
+        {
+            "_index": index_name,
+            "_source": record
+        }
+        for record in records
+    ]
+    
+    try:
+        # Bulk insert
+        success_count, failed_items = bulk(client, actions, raise_on_error=False)
+        
+        if failed_items:
+            logger.warning(f"Failed to push {len(failed_items)} records to {index_name}")
+            # Log first few failures for debugging
+            for item in failed_items[:5]:
+                logger.warning(f"Failed item: {item}")
+        else:
+            logger.info(f"Successfully pushed {success_count} records to {index_name}")
+            
+    except Exception as e:
+        logger.error(f"Error pushing data to OpenSearch: {e}")
+        logger.warning("Continuing without OpenSearch push. CSV file is still saved.")
+
+
 def main():
     """Main ETL job execution."""
     logger.info("Starting ETL job...")
@@ -565,9 +603,15 @@ def main():
             logger.warning("No training data after mapping tutors. Exiting.")
             return
         
-        # Step 9: Save training data (use target date for filename)
+        # Step 9: Save training data to CSV (use target date for filename)
         target_date_str = target_date.strftime('%Y.%m.%d')
         output_path = save_training_data(search_df, target_date_str)
+        
+        # Step 10: Push training data to OpenSearch for monitoring (optional, continues on error)
+        try:
+            save_training_data_to_opensearch(client, search_df, target_date_str)
+        except Exception as e:
+            logger.warning(f"Failed to push data to OpenSearch: {e}. CSV file is still saved.")
         
         logger.info("ETL job completed successfully!")
         logger.info(f"Output: {output_path}")

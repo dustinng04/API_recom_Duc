@@ -14,9 +14,11 @@ import numpy as np
 import lightgbm as lgb
 import pickle
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 import argparse
+from datetime import datetime
 from sklearn.preprocessing import StandardScaler
 
 # Setup logging
@@ -68,18 +70,66 @@ def prepare_features(df: pd.DataFrame) -> tuple:
     """
     logger.info("Preparing features...")
     
+    initial_rows = len(df)
+    logger.info(f"Initial data rows: {initial_rows}")
+    
+    # Remove rows with missing (NaN) query only
+    # Empty string query is valid (could be default search or browse mode)
+    missing_query_before = df[GROUP_COLUMN].isna().sum()
+    if missing_query_before > 0:
+        logger.warning(f"Found {missing_query_before} rows with missing (NaN) query. Removing them...")
+        df = df.dropna(subset=[GROUP_COLUMN]).copy()
+        logger.info(f"Removed {missing_query_before} rows with missing query. Remaining rows: {len(df)}")
+    
+    # Log empty query count (for information, but we keep them)
+    empty_query_count = (df[GROUP_COLUMN] == '').sum()
+    if empty_query_count > 0:
+        logger.info(f"Found {empty_query_count} rows with empty query (will be grouped together)")
+    
+    # Handle duplicates: same (query, tutorId) pair may appear multiple times
+    # Strategy: Keep the row with label=1 if any, otherwise keep the first one
+    # This ensures we don't lose positive examples
+    duplicates_before = df.duplicated(subset=[GROUP_COLUMN, 'tutorId']).sum()
+    if duplicates_before > 0:
+        logger.warning(f"Found {duplicates_before} duplicate (query, tutorId) pairs. Removing duplicates...")
+        
+        # Sort by label descending (1 before 0) to prioritize positive examples
+        df = df.sort_values(by='label', ascending=False).reset_index(drop=True)
+        
+        # Remove duplicates, keeping first (which will be label=1 if available)
+        df = df.drop_duplicates(subset=[GROUP_COLUMN, 'tutorId'], keep='first').reset_index(drop=True)
+        
+        duplicates_after = df.duplicated(subset=[GROUP_COLUMN, 'tutorId']).sum()
+        rows_removed = initial_rows - len(df)
+        logger.info(f"Removed {rows_removed} duplicate rows. Remaining rows: {len(df)}")
+        logger.info(f"Remaining duplicates: {duplicates_after} (should be 0)")
+    
+    # IMPORTANT: Sort by query to ensure groups are contiguous
+    # This is required for proper train/val split by groups
+    df_sorted = df.sort_values(by=GROUP_COLUMN).reset_index(drop=True)
+    
     # Extract features
-    X = df[FEATURE_COLUMNS].values.astype(np.float32)
-    y = df[LABEL_COLUMN].values.astype(np.int32)
+    X = df_sorted[FEATURE_COLUMNS].values.astype(np.float32)
+    y = df_sorted[LABEL_COLUMN].values.astype(np.int32)
     
     # Group by query for learning-to-rank
     # Each query represents a group (list of candidates)
-    groups = df.groupby(GROUP_COLUMN).size().values.astype(np.int32)
+    # After sorting, groups will be contiguous in the data
+    groups = df_sorted.groupby(GROUP_COLUMN).size().values.astype(np.int32)
+    
+    # Verify that sum of groups equals total data size
+    total_group_size = groups.sum()
+    if total_group_size != len(X):
+        raise ValueError(
+            f"Group sizes don't match data size: {total_group_size} != {len(X)}. "
+            f"This may indicate data inconsistency after duplicate removal."
+        )
     
     logger.info(f"Features shape: {X.shape}")
     logger.info(f"Labels: {y.sum()} positive, {(y == 0).sum()} negative")
     logger.info(f"Number of groups (queries): {len(groups)}")
     logger.info(f"Average group size: {groups.mean():.2f}")
+    logger.info(f"Total group size sum: {total_group_size} (matches data size: {len(X)})")
     
     return X, y, groups
 
@@ -109,20 +159,39 @@ def train_model(
     n_groups = len(groups)
     n_train_groups = int(n_groups * (1 - test_size))
     
+    # Ensure we have at least 1 group in each set
+    if n_train_groups == 0:
+        n_train_groups = 1
+    if n_train_groups >= n_groups:
+        n_train_groups = n_groups - 1
+    
     # Calculate indices for train/val split
     cumsum_groups = np.cumsum(groups)
     train_end_idx = cumsum_groups[n_train_groups - 1]
     
     X_train = X[:train_end_idx]
     y_train = y[:train_end_idx]
-    groups_train = groups[:n_train_groups]
+    groups_train = groups[:n_train_groups].copy()
     
     X_val = X[train_end_idx:]
     y_val = y[train_end_idx:]
-    groups_val = groups[n_train_groups:]
+    groups_val = groups[n_train_groups:].copy()
     
-    logger.info(f"Train: {len(X_train)} samples in {len(groups_train)} groups")
-    logger.info(f"Validation: {len(X_val)} samples in {len(groups_val)} groups")
+    # Verify group sizes match data sizes
+    train_group_sum = groups_train.sum()
+    val_group_sum = groups_val.sum()
+    
+    logger.info(f"Train: {len(X_train)} samples in {len(groups_train)} groups (sum: {train_group_sum})")
+    logger.info(f"Validation: {len(X_val)} samples in {len(groups_val)} groups (sum: {val_group_sum})")
+    
+    # Validate group sizes match data sizes
+    if train_group_sum != len(X_train):
+        logger.error(f"Train group sum mismatch: {train_group_sum} != {len(X_train)}")
+        raise ValueError(f"Train group sizes don't match data size: {train_group_sum} != {len(X_train)}")
+    
+    if val_group_sum != len(X_val):
+        logger.error(f"Validation group sum mismatch: {val_group_sum} != {len(X_val)}")
+        raise ValueError(f"Validation group sizes don't match data size: {val_group_sum} != {len(X_val)}")
     
     # Fit scaler on training data only
     logger.info("Fitting StandardScaler on training data...")
@@ -185,15 +254,24 @@ def save_model(
     model: lgb.Booster,
     scaler: StandardScaler,
     model_path: Path,
-    update_recommender: bool = True
+    update_recommender: bool = True,
+    backup_existing: bool = True
 ):
     """
     Save trained model and scaler to disk.
     If update_recommender is True, also update the main recommender model file.
+    If backup_existing is True, creates a backup of existing model before overwriting.
     """
     logger.info(f"Saving model to {model_path}")
     
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Backup existing model if it exists
+    if backup_existing and model_path.exists():
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_path = model_path.parent / f"{model_path.stem}_backup_{timestamp}.pkl"
+        shutil.copy2(model_path, backup_path)
+        logger.info(f"Backed up existing model to {backup_path}")
     
     # Save reranker model separately
     with open(model_path, 'wb') as f:
@@ -202,7 +280,8 @@ def save_model(
             'scaler': scaler,
             'feature_columns': FEATURE_COLUMNS,
             'label_column': LABEL_COLUMN,
-            'group_column': GROUP_COLUMN
+            'group_column': GROUP_COLUMN,
+            'trained_at': datetime.now().isoformat()
         }, f)
     
     logger.info(f"Reranker model saved successfully to {model_path}")
